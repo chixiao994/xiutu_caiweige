@@ -51,6 +51,7 @@ v1.2
 
 
 v1.1
+
 包含的核心功能：
 
 1. 色阶特征分析 (ImageLv1Feature.get_levels_feature)
