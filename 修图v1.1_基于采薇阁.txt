@@ -1,0 +1,664 @@
+import os
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import tkinter as tk
+from tkinter import filedialog, ttk
+from pathlib import Path
+from scipy import stats
+import matplotlib.pyplot as plt
+
+class BasicModule:
+    """基础工具模块"""
+    
+    @staticmethod
+    def divide(ratio, range_values):
+        """等分切割区域"""
+        start, end = range_values
+        total = end - start
+        segment_height = int(total * ratio)
+        segments = []
+        current = start
+        while current < end:
+            next_segment = min(current + segment_height, end)
+            segments.append((current, next_segment))
+            current = next_segment
+        return segments
+    
+    @staticmethod
+    def get_region(points, max_width):
+        """获取点集区域"""
+        if not points:
+            return [0, 0]
+        x_coords = [p for p in points if isinstance(p, (int, float))]
+        if not x_coords:
+            if points and isinstance(points[0], (list, tuple)):
+                x_coords = [p[0] for p in points]
+            else:
+                return [0, 0]
+        return [min(x_coords), max(x_coords)]
+    
+    @staticmethod
+    def points_to_line(point1, point2):
+        """两点确定直线"""
+        x1, y1 = point1
+        x2, y2 = point2
+        if x1 == x2:
+            return [float('inf'), x1]
+        k = (y2 - y1) / (x2 - x1)
+        b = y1 - k * x1
+        return [k, b]
+    
+    @staticmethod
+    def img_resize(image, new_h=2598):
+        """调整图像尺寸到22cm 300DPI"""
+        h, w = image.shape[:2]
+        aspect_ratio = w / h
+        new_w = int(new_h * aspect_ratio)
+        
+        # 宽度不超过14cm (1654像素)
+        max_width = 1654
+        if new_w > max_width:
+            new_w = max_width
+            new_h = int(new_w / aspect_ratio)
+            
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return resized
+    
+    @staticmethod
+    def get_thresh_value(image):
+        """获取二值化阈值"""
+        return np.mean(image) * 0.7
+    
+    @staticmethod
+    def save_cv2img_as_300dpi(img, path, as_jpg=True):
+        """保存为300DPI图像"""
+        if as_jpg:
+            cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            cv2.imwrite(path, img)
+
+class SimpleLinearRegression:
+    """简单线性回归"""
+    
+    def __init__(self, points):
+        self.points = points
+        
+    def fit(self, direction='horizontal'):
+        """拟合直线"""
+        if not self.points:
+            return [0, 0]
+            
+        if all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in self.points):
+            x_coords = [p[0] for p in self.points]
+            y_coords = [p[1] for p in self.points]
+        else:
+            if direction == 'horizontal':
+                x_coords = list(range(len(self.points)))
+                y_coords = self.points
+            else:
+                y_coords = list(range(len(self.points)))
+                x_coords = self.points
+                
+        if len(x_coords) < 2:
+            return [0, np.mean(y_coords) if y_coords else 0]
+            
+        slope, intercept, _, _, _ = stats.linregress(x_coords, y_coords)
+        return [slope, intercept]
+
+class ImageLv1Feature:
+    """色阶特征分析"""
+    
+    def __init__(self, img, direction, if_thresh='auto'):
+        self.img = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        self.direction = direction
+        self.h, self.w = self.img.shape
+        self.if_thresh = if_thresh
+        
+        if if_thresh == 'auto':
+            self.img = cv2.adaptiveThreshold(self.img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                           cv2.THRESH_BINARY, 11, 2)
+        
+    def get_levels_feature(self, w_state=(0, 1), h_state=(0, 1), pixel=1):
+        """获取色阶变化曲线"""
+        h_start = int(self.h * h_state[0])
+        h_end = int(self.h * h_state[1])
+        w_start = int(self.w * w_state[0])
+        w_end = int(self.w * w_state[1])
+        
+        levels_feature = []
+        
+        if self.direction == 'horizontal':
+            n = 0
+            while n < self.w:
+                end_n = min(n + pixel, self.w)
+                if n >= w_end or end_n <= w_start:
+                    levels_feature.append(255)
+                else:
+                    cut_img = self.img[h_start:h_end, n:end_n]
+                    dots_average = np.mean(cut_img)
+                    levels_feature.append(dots_average)
+                n += pixel
+        else:
+            n = 0
+            while n < self.h:
+                end_n = min(n + pixel, self.h)
+                if n >= h_end or end_n <= h_start:
+                    levels_feature.append(255)
+                else:
+                    cut_img = self.img[n:end_n, w_start:w_end]
+                    dots_average = np.mean(cut_img)
+                    levels_feature.append(dots_average)
+                n += pixel
+                
+        return levels_feature
+    
+    def get_classify_points(self, min_range, filtering=True):
+        """分类点集检测"""
+        feature = self.get_levels_feature()
+        points = []
+        
+        # 找到色阶变化的边缘点
+        gradient = np.gradient(feature)
+        threshold = np.mean(np.abs(gradient)) * 2
+        
+        for i in range(1, len(gradient)-1):
+            if abs(gradient[i]) > threshold:
+                points.append(i)
+        
+        # 过滤接近的点
+        if filtering and len(points) > 1:
+            filtered_points = [points[0]]
+            for i in range(1, len(points)):
+                if points[i] - filtered_points[-1] >= min_range:
+                    filtered_points.append(points[i])
+            points = filtered_points
+            
+        return points
+
+class AncientBookProcessor:
+    """古籍书影处理器 - 完整实现"""
+    
+    def __init__(self):
+        self.colors = {
+            'boundary': (0, 255, 0),      # 绿色 - 边界
+            'a_vertical': (255, 0, 0),    # 蓝色 - A面垂直框线
+            'b_vertical': (0, 0, 255),    # 红色 - B面垂直框线  
+            'spine': (255, 255, 0),       # 黄色 - 书口
+            'middle': (0, 255, 255),      # 青色 - 中缝
+            'a_horizontal': (255, 0, 255), # 紫色 - A面水平框线
+            'b_horizontal': (255, 165, 0) # 橙色 - B面水平框线
+        }
+    
+    def create_marked_image(self, image, boundaries, lines, spine_points):
+        """创建运行标记图"""
+        marked = image.copy()
+        h, w = marked.shape[:2]
+        
+        # 绘制边界 (绿色)
+        cv2.rectangle(marked, 
+                     (boundaries['left'], boundaries['top']),
+                     (boundaries['right'], boundaries['bottom']), 
+                     self.colors['boundary'], 3)
+        
+        # 绘制垂直框线
+        for line in lines.get('a_vertical', []):
+            if len(line) == 4:
+                cv2.line(marked, (line[0], line[1]), (line[2], line[3]), 
+                        self.colors['a_vertical'], 2)
+        
+        for line in lines.get('b_vertical', []):
+            if len(line) == 4:
+                cv2.line(marked, (line[0], line[1]), (line[2], line[3]), 
+                        self.colors['b_vertical'], 2)
+        
+        # 绘制书口位置
+        for point in spine_points:
+            if len(point) == 2:
+                cv2.circle(marked, point, 8, self.colors['spine'], -1)
+        
+        # 绘制水平框线
+        for line in lines.get('a_horizontal', []):
+            if len(line) == 4:
+                cv2.line(marked, (line[0], line[1]), (line[2], line[3]), 
+                        self.colors['a_horizontal'], 2)
+        
+        for line in lines.get('b_horizontal', []):
+            if len(line) == 4:
+                cv2.line(marked, (line[0], line[1]), (line[2], line[3]), 
+                        self.colors['b_horizontal'], 2)
+        
+        # 添加图例
+        self.add_legend(marked)
+        
+        return marked
+    
+    def add_legend(self, image):
+        """添加图例说明"""
+        h, w = image.shape[:2]
+        legend_x = w - 250
+        legend_y = 30
+        line_height = 25
+        
+        for i, (name, color) in enumerate(self.colors.items()):
+            color_name = {
+                'boundary': '边界',
+                'a_vertical': 'A面垂直框线', 
+                'b_vertical': 'B面垂直框线',
+                'spine': '书口位置',
+                'middle': '中缝',
+                'a_horizontal': 'A面水平框线',
+                'b_horizontal': 'B面水平框线'
+            }.get(name, name)
+            
+            # 绘制颜色方块
+            cv2.rectangle(image, (legend_x, legend_y + i*line_height),
+                         (legend_x + 20, legend_y + i*line_height + 15), color, -1)
+            cv2.rectangle(image, (legend_x, legend_y + i*line_height),
+                         (legend_x + 20, legend_y + i*line_height + 15), (255,255,255), 1)
+            
+            # 添加文字
+            cv2.putText(image, color_name, (legend_x + 30, legend_y + i*line_height + 12),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    
+    def find_content_boundary(self, image):
+        """查找内容边界 - 处理固定背景干扰"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape
+        
+        # 获取色阶变化曲线
+        horizontal_feature = ImageLv1Feature(gray, 'horizontal').get_levels_feature()
+        vertical_feature = ImageLv1Feature(gray, 'vertical').get_levels_feature()
+        
+        # 找到第一个颜色变化位置
+        def find_edge(feature, threshold_ratio=0.3):
+            threshold = np.max(feature) * threshold_ratio
+            for i in range(len(feature)):
+                if feature[i] < threshold:
+                    return i
+            return 0
+        
+        left = find_edge(horizontal_feature)
+        right = w - find_edge(horizontal_feature[::-1])
+        top = find_edge(vertical_feature) 
+        bottom = h - find_edge(vertical_feature[::-1])
+        
+        return {
+            'left': max(0, left - 10),
+            'right': min(w, right + 10),
+            'top': max(0, top - 10),
+            'bottom': min(h, bottom + 10)
+        }
+    
+    def detect_vertical_lines(self, image, boundaries, side='a', top_ratio=0.35, bottom_ratio=0.2):
+        """检测垂直方向框线"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        left, right, top, bottom = boundaries['left'], boundaries['right'], boundaries['top'], boundaries['bottom']
+        
+        # 确定检测区域
+        if side == 'a':
+            detect_left = (left + right) // 2
+            detect_right = right
+        else:
+            detect_left = left
+            detect_right = (left + right) // 2
+        
+        lines = []
+        
+        # 上下区域检测
+        for region_type, y_start, y_end in [('top', top, top + int((bottom-top)*top_ratio)),
+                                          ('bottom', bottom - int((bottom-top)*bottom_ratio), bottom)]:
+            
+            region = gray[y_start:y_end, detect_left:detect_right]
+            
+            # 等分切割
+            segments = BasicModule.divide(0.1, (0, region.shape[0]))
+            segment_lines = []
+            
+            for seg_start, seg_end in segments:
+                seg_img = region[seg_start:seg_end, :]
+                
+                # 边缘检测
+                edges = cv2.Canny(seg_img, 50, 150)
+                
+                # 霍夫变换检测直线
+                hough_lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
+                                            minLineLength=seg_img.shape[0]//2, maxLineGap=10)
+                
+                if hough_lines is not None:
+                    for line in hough_lines:
+                        x1, y1, x2, y2 = line[0]
+                        # 转换为原图坐标
+                        abs_x1 = x1 + detect_left
+                        abs_y1 = y1 + y_start + seg_start
+                        abs_x2 = x2 + detect_left
+                        abs_y2 = y2 + y_start + seg_start
+                        segment_lines.append([abs_x1, abs_y1, abs_x2, abs_y2])
+            
+            if segment_lines:
+                # 选择最长的线
+                longest_line = max(segment_lines, key=lambda l: np.sqrt((l[2]-l[0])**2 + (l[3]-l[1])**2))
+                lines.append(longest_line)
+        
+        return lines
+    
+    def find_book_spine(self, image, boundaries, vertical_lines):
+        """查找书口位置"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        left, right, top, bottom = boundaries['left'], boundaries['right'], boundaries['top'], boundaries['bottom']
+        
+        # 通过垂直框线确定书口搜索范围
+        if vertical_lines:
+            a_lines = [l for l in vertical_lines if l[0] > (left+right)//2]
+            b_lines = [l for l in vertical_lines if l[0] < (left+right)//2]
+            
+            if a_lines and b_lines:
+                spine_left = max([l[0] for l in b_lines])
+                spine_right = min([l[0] for l in a_lines])
+                spine_center = (spine_left + spine_right) // 2
+                
+                # 上下多点检测
+                spine_points = []
+                for y in range(top, bottom, (bottom-top)//10):
+                    region = gray[y:y+10, spine_center-20:spine_center+20]
+                    if region.size > 0:
+                        profile = np.mean(region, axis=1)
+                        if len(profile) > 0:
+                            min_idx = np.argmin(profile)
+                            spine_points.append((spine_center, y + min_idx))
+                
+                return spine_points
+        
+        return []
+    
+    def detect_horizontal_lines(self, image, boundaries, spine_position):
+        """检测水平方向框线"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        left, right, top, bottom = boundaries['left'], boundaries['right'], boundaries['top'], boundaries['bottom']
+        
+        lines = []
+        
+        # 在已知垂直位置附近检测水平线
+        for y_region in [top + (bottom-top)//4, top + (bottom-top)*3//4]:
+            region_top = max(top, y_region - 30)
+            region_bottom = min(bottom, y_region + 30)
+            
+            region = gray[region_top:region_bottom, left:right]
+            
+            edges = cv2.Canny(region, 50, 150)
+            hough_lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30,
+                                        minLineLength=100, maxLineGap=10)
+            
+            if hough_lines is not None:
+                for line in hough_lines:
+                    x1, y1, x2, y2 = line[0]
+                    angle = np.abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+                    if angle < 15 or angle > 165:  # 接近水平的线
+                        abs_y = (y1 + y2) // 2 + region_top
+                        lines.append([left, abs_y, right, abs_y])
+        
+        return lines
+    
+    def handle_special_cases(self, image, case_type, parameters=None):
+        """处理特殊情况"""
+        if case_type == "overlapping_lines":
+            # 处理框线重合情况 - 沿中缝裁切
+            return self.cut_along_spine(image, parameters)
+        elif case_type == "severe_tilt":
+            # 处理严重倾斜
+            return self.correct_severe_tilt(image, parameters)
+        elif case_type == "heavy_noise":
+            # 处理重度噪点
+            return self.filter_heavy_noise(image, parameters)
+        elif case_type == "head_notes":
+            # 处理眉批
+            return self.preserve_head_notes(image, parameters)
+        
+        return image
+    
+    def cut_along_spine(self, image, parameters):
+        """沿中缝裁切 - 处理框线重合"""
+        h, w = image.shape[:2]
+        middle = w // 2
+        
+        # A面从中缝左边开始，B面从右边开始
+        a_side = image[:, middle-5:]
+        b_side = image[:, :middle+5]
+        
+        return a_side, b_side
+    
+    def correct_severe_tilt(self, image, parameters):
+        """校正严重倾斜"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
+        # 使用霍夫变换检测主要直线方向
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=100)
+        
+        if lines is not None:
+            angles = []
+            for rho, theta in lines[:,0]:
+                angle = theta * 180 / np.pi
+                if 80 < angle < 100:  # 接近垂直的线
+                    angles.append(angle - 90)
+            
+            if angles:
+                avg_angle = np.mean(angles)
+                # 旋转校正
+                center = (w//2, h//2)
+                rotation_matrix = cv2.getRotationMatrix2D(center, avg_angle, 1.0)
+                corrected = cv2.warpAffine(image, rotation_matrix, (w, h), flags=cv2.INTER_CUBIC)
+                return corrected
+        
+        return image
+    
+    def filter_heavy_noise(self, image, parameters):
+        """处理重度噪点"""
+        # 中值滤波去噪
+        filtered = cv2.medianBlur(image, 5)
+        
+        # 形态学操作增强框线
+        kernel = np.ones((3,3), np.uint8)
+        filtered = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, kernel)
+        
+        return filtered
+    
+    def preserve_head_notes(self, image, parameters):
+        """保留眉批 - 调整天头尺寸"""
+        # 在最终裁切时调整天头尺寸即可
+        return image
+    
+    def process_double_page_outward(self, image_path, output_dir, create_marked=True):
+        """处理双页书口朝外"""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"无法加载图像: {image_path}")
+        
+        # 1. 查找内容边界
+        boundaries = self.find_content_boundary(image)
+        
+        # 2. 检测垂直框线
+        a_vertical = self.detect_vertical_lines(image, boundaries, 'a')
+        b_vertical = self.detect_vertical_lines(image, boundaries, 'b')
+        
+        # 3. 查找书口位置
+        spine_points = self.find_book_spine(image, boundaries, a_vertical + b_vertical)
+        
+        # 4. 检测水平框线
+        middle_x = (boundaries['left'] + boundaries['right']) // 2
+        horizontal_lines = self.detect_horizontal_lines(image, boundaries, middle_x)
+        
+        # 5. 创建标记图
+        if create_marked:
+            lines_dict = {
+                'a_vertical': a_vertical,
+                'b_vertical': b_vertical,
+                'a_horizontal': [l for l in horizontal_lines if l[0] > middle_x],
+                'b_horizontal': [l for l in horizontal_lines if l[0] < middle_x]
+            }
+            marked_image = self.create_marked_image(image, boundaries, lines_dict, spine_points)
+            
+            marked_path = Path(output_dir) / (Path(image_path).stem + '_marked.jpg')
+            cv2.imwrite(str(marked_path), marked_image)
+        
+        # 6. 分割页面并保存
+        a_page, b_page = self.split_and_correct_pages(image, boundaries, a_vertical, b_vertical, spine_points)
+        
+        a_path = Path(output_dir) / (Path(image_path).stem + '_a.jpg')
+        b_path = Path(output_dir) / (Path(image_path).stem + '_b.jpg')
+        
+        BasicModule.save_cv2img_as_300dpi(a_page, str(a_path), True)
+        BasicModule.save_cv2img_as_300dpi(b_page, str(b_path), True)
+        
+        return str(a_path), str(b_path)
+    
+    def split_and_correct_pages(self, image, boundaries, a_vertical, b_vertical, spine_points):
+        """分割并校正页面"""
+        h, w = image.shape[:2]
+        
+        # 计算分割线
+        if spine_points:
+            spine_x = np.mean([p[0] for p in spine_points])
+        else:
+            spine_x = (boundaries['left'] + boundaries['right']) // 2
+        
+        # 分割页面
+        a_page = image[:, int(spine_x):boundaries['right']]
+        b_page = image[:, boundaries['left']:int(spine_x)]
+        
+        # 调整尺寸
+        a_page = BasicModule.img_resize(a_page)
+        b_page = BasicModule.img_resize(b_page)
+        
+        return a_page, b_page
+
+# GUI界面
+class AncientBookGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("古籍书影自动修图程序 - 完整版")
+        self.root.geometry("600x500")
+        self.processor = AncientBookProcessor()
+        self.setup_ui()
+    
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 标题
+        title_label = ttk.Label(main_frame, text="古籍书影自动修图程序", 
+                               font=("Arial", 16, "bold"))
+        title_label.pack(pady=10)
+        
+        # 处理选项
+        options_frame = ttk.LabelFrame(main_frame, text="处理选项", padding="10")
+        options_frame.pack(fill=tk.X, pady=10)
+        
+        self.create_marked = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="生成运行标记图", 
+                       variable=self.create_marked).pack(anchor=tk.W)
+        
+        self.handle_special = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="自动处理特殊情况", 
+                       variable=self.handle_special).pack(anchor=tk.W)
+        
+        # 特殊情况处理
+        special_frame = ttk.LabelFrame(main_frame, text="特殊情况处理", padding="10")
+        special_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(special_frame, text="框线重合", 
+                  command=lambda: self.handle_special_case("overlapping_lines")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(special_frame, text="严重倾斜", 
+                  command=lambda: self.handle_special_case("severe_tilt")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(special_frame, text="重度噪点", 
+                  command=lambda: self.handle_special_case("heavy_noise")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(special_frame, text="眉批保留", 
+                  command=lambda: self.handle_special_case("head_notes")).pack(side=tk.LEFT, padx=5)
+        
+        # 按钮区域
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=20)
+        
+        ttk.Button(button_frame, text="选择图像", command=self.select_image).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="开始处理", command=self.process_image).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="批量处理", command=self.batch_process).pack(side=tk.LEFT, padx=5)
+        
+        # 状态显示
+        self.status = ttk.Label(main_frame, text="就绪", relief=tk.SUNKEN)
+        self.status.pack(fill=tk.X, pady=10)
+    
+    def select_image(self):
+        file_path = filedialog.askopenfilename(
+            title="选择古籍图像",
+            filetypes=[("图像文件", "*.jpg *.jpeg *.png *.tif *.tiff")]
+        )
+        if file_path:
+            self.image_path = file_path
+            self.status.config(text=f"已选择: {Path(file_path).name}")
+    
+    def process_image(self):
+        if not hasattr(self, 'image_path'):
+            self.status.config(text="请先选择图像")
+            return
+            
+        try:
+            output_dir = Path(self.image_path).parent / "processed"
+            output_dir.mkdir(exist_ok=True)
+            
+            a_path, b_path = self.processor.process_double_page_outward(
+                self.image_path, str(output_dir), self.create_marked.get())
+            
+            self.status.config(text=f"处理完成: {Path(a_path).name}, {Path(b_path).name}")
+            
+        except Exception as e:
+            self.status.config(text=f"处理失败: {str(e)}")
+    
+    def handle_special_case(self, case_type):
+        if not hasattr(self, 'image_path'):
+            self.status.config(text="请先选择图像")
+            return
+        
+        try:
+            image = cv2.imread(self.image_path)
+            processed = self.processor.handle_special_cases(image, case_type)
+            
+            output_dir = Path(self.image_path).parent / "special_cases"
+            output_dir.mkdir(exist_ok=True)
+            
+            output_path = output_dir / f"{Path(self.image_path).stem}_{case_type}.jpg"
+            cv2.imwrite(str(output_path), processed)
+            
+            self.status.config(text=f"特殊处理完成: {output_path.name}")
+            
+        except Exception as e:
+            self.status.config(text=f"特殊处理失败: {str(e)}")
+    
+    def batch_process(self):
+        folder_path = filedialog.askdirectory(title="选择包含古籍图像的文件夹")
+        if not folder_path:
+            return
+            
+        try:
+            output_dir = Path(folder_path) / "processed"
+            output_dir.mkdir(exist_ok=True)
+            
+            count = 0
+            for image_file in Path(folder_path).glob("*.*"):
+                if image_file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tif', '.tiff']:
+                    try:
+                        self.processor.process_double_page_outward(
+                            str(image_file), str(output_dir), self.create_marked.get())
+                        count += 1
+                        self.status.config(text=f"已处理: {count} 个文件...")
+                        self.root.update()
+                    except Exception as e:
+                        print(f"处理失败 {image_file}: {e}")
+            
+            self.status.config(text=f"批量处理完成: 共处理 {count} 个文件")
+            
+        except Exception as e:
+            self.status.config(text=f"批量处理失败: {str(e)}")
+
+if __name__ == "__main__":
+    gui = AncientBookGUI()
+    gui.root.mainloop()
